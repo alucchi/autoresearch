@@ -8,14 +8,18 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
+import argparse
 import gc
 import math
+import subprocess
 import time
 from dataclasses import dataclass, asdict
+from datetime import datetime
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import wandb
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
@@ -234,7 +238,8 @@ class GPT(nn.Module):
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5,
+                        matrix_optimizer='muon'):
         model_dim = self.config.n_embd
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
@@ -254,11 +259,24 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+        if matrix_optimizer == 'muon':
+            for shape in sorted({p.shape for p in matrix_params}):
+                group_params = [p for p in matrix_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', params=group_params, lr=matrix_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+                ))
+        elif matrix_optimizer == 'sgd':
             param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+                kind='sgd', params=matrix_params,
+                lr=matrix_lr, momentum=0.9, weight_decay=weight_decay,
+                normalize_grad=True,
+            ))
+        else:
+            param_groups.append(dict(
+                kind='adamw', params=matrix_params,
+                lr=matrix_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10,
+                weight_decay=weight_decay,
             ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
@@ -417,6 +435,33 @@ class MuonAdamW(torch.optim.Optimizer):
                         self._muon_beta2_t, group["ns_steps"], red_dim)
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
+    def _step_sgd(self, group):
+        lr = group['lr']
+        momentum = group['momentum']
+        wd = group['weight_decay']
+        normalize = group.get('normalize_grad', False)
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            grad = p.grad
+            if normalize:
+                g_norm = grad.norm()
+                if g_norm > 0:
+                    grad = grad / (g_norm + 1e-8)
+            state = self.state[p]
+            if 'momentum_buffer' not in state:
+                state['momentum_buffer'] = torch.zeros_like(p)
+            buf = state['momentum_buffer']
+            buf.mul_(momentum).add_(grad)
+            if wd != 0.0:
+                p.mul_(1.0 - lr * wd)
+            # Scale LR by sqrt(rows/cols) for non-square matrices (Muon-style)
+            if p.dim() == 2:
+                effective_lr = lr * max(1.0, p.shape[0] / p.shape[1]) ** 0.5
+            else:
+                effective_lr = lr
+            p.add_(buf, alpha=-effective_lr)
+
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
@@ -424,31 +469,73 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_adamw(group)
             elif group['kind'] == 'muon':
                 self._step_muon(group)
+            elif group['kind'] == 'sgd':
+                self._step_sgd(group)
+
+# ---------------------------------------------------------------------------
+# Model presets
+# ---------------------------------------------------------------------------
+
+MODEL_PRESETS = {
+    # (n_layer, n_head, n_embd, device_batch_size)
+    "50M":   ( 8,  4,  512, 32),
+    "135M":  (12,  6,  768, 32),
+    "1B":    (18, 16, 2048,  4),
+}
+
+# ---------------------------------------------------------------------------
+# CLI Arguments
+# ---------------------------------------------------------------------------
+
+parser = argparse.ArgumentParser(description="Autoresearch pretraining script")
+parser.add_argument("--wandb", type=int, default=1, help="Enable Weights & Biases logging (0 = disabled, non-zero = enabled)")
+parser.add_argument("--time-budget", type=int, default=None, help="Training time budget in seconds (default: 300)")
+parser.add_argument("--logging-steps", type=int, default=5, help="How often (in steps) to log metrics to wandb (default: 1)")
+parser.add_argument("--optimizer", type=str, default="sgd", choices=["muon", "adam", "sgd"],
+                    help="Optimizer for matrix parameters: 'muon' (default), 'adam' (AdamW), or 'sgd' (SGD with momentum)")
+parser.add_argument("--model", choices=list(MODEL_PRESETS), default="50M",
+                    help="Model size preset (default: 50M)")
+args = parser.parse_args()
+
+# Convert integer flag to boolean and disable wandb if requested
+wandb_enabled = bool(args.wandb)
+print(f"Wandb logging enabled: {wandb_enabled}")
+if not wandb_enabled:
+    wandb.disabled = True
+
+# How often to record logs to wandb (every N steps)
+logging_steps = max(1, int(args.logging_steps))
+print(f"Wandb logging frequency: every {logging_steps} step(s)")
+
+# Use provided time budget or default from prepare.py
+if args.time_budget is not None:
+    TIME_BUDGET = args.time_budget
+print(f"Using time budget: {TIME_BUDGET}s")
+
+_n_layer, _n_head, _n_embd, _batch_size = MODEL_PRESETS[args.model]
+print(f"Using model preset: {args.model}")
 
 # ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**15 # ~32K tokens per step (2x more optimizer steps)
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
+MATRIX_LR = 0.18        # slightly lower LR for smaller batch (sqrt(2) scale)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
+WEIGHT_DECAY = 0.0      # no weight decay
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
+WARMUP_RATIO = 0.0      # no warmup
+WARMDOWN_RATIO = 0.2    # warmdown for last 20%
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 16  # half batch for 2x more optimizer steps
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -466,17 +553,14 @@ tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
 
-def build_model_config(depth):
-    base_dim = depth * ASPECT_RATIO
-    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-    num_heads = model_dim // HEAD_DIM
+def build_model_config():
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        n_layer=_n_layer, n_head=_n_head, n_kv_head=_n_head, n_embd=_n_embd,
         window_pattern=WINDOW_PATTERN,
     )
 
-config = build_model_config(DEPTH)
+config = build_model_config()
 print(f"Model config: {asdict(config)}")
 
 with torch.device("meta"):
@@ -503,7 +587,9 @@ optimizer = model.setup_optimizer(
     adam_betas=ADAM_BETAS,
     matrix_lr=MATRIX_LR,
     weight_decay=WEIGHT_DECAY,
+    matrix_optimizer=args.optimizer,
 )
+print(f"Matrix optimizer: {args.optimizer}")
 
 model = torch.compile(model, dynamic=False)
 
@@ -512,6 +598,39 @@ x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
+
+# Initialize Weights & Biases
+# Get git commit hash for run name
+try:
+    commit_hash = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD']).decode().strip()
+except:
+    print("Using timestamp as commit hash fallback")
+    commit_hash = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+if wandb_enabled:
+    run_name = f"gpt-{args.model}-{args.optimizer}-bs{DEVICE_BATCH_SIZE}-{TOTAL_BATCH_SIZE}-seq{MAX_SEQ_LEN}-{commit_hash}"
+    wandb.init(
+        project="autoresearch",
+        name=run_name,
+        config={
+            "model_preset": args.model,
+            "depth": _n_layer,
+            "window_pattern": WINDOW_PATTERN,
+            "vocab_size": vocab_size,
+            "total_batch_size": TOTAL_BATCH_SIZE,
+            "embedding_lr": EMBEDDING_LR,
+            "unembedding_lr": UNEMBEDDING_LR,
+            "matrix_lr": MATRIX_LR,
+            "scalar_lr": SCALAR_LR,
+            "weight_decay": WEIGHT_DECAY,
+            "adam_betas": ADAM_BETAS,
+            "warmup_ratio": WARMUP_RATIO,
+            "warmdown_ratio": WARMDOWN_RATIO,
+            "final_lr_frac": FINAL_LR_FRAC,
+            "device_batch_size": DEVICE_BATCH_SIZE,
+            "time_budget": TIME_BUDGET,
+        },
+    )
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
@@ -525,8 +644,9 @@ def get_lr_multiplier(progress):
         return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
 def get_muon_momentum(step):
-    frac = min(step / 300, 1)
-    return (1 - frac) * 0.85 + frac * 0.95
+    # Warmup from 0.6 to 0.9 over first 50 steps
+    frac = min(step / 50, 1.0)
+    return (1 - frac) * 0.6 + frac * 0.9
 
 def get_weight_decay(progress):
     return WEIGHT_DECAY * (1 - progress)
@@ -535,6 +655,7 @@ def get_weight_decay(progress):
 # Training loop
 # ---------------------------------------------------------------------------
 
+print(f"Starting training | model: {args.model} | params: {num_params / 1e6:.1f}M")
 t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
@@ -559,6 +680,9 @@ while True:
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
+            group["momentum"] = muon_momentum
+            group["weight_decay"] = muon_weight_decay
+        elif group['kind'] == 'sgd':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
@@ -588,6 +712,40 @@ while True:
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+
+    # Log to Weights & Biases (respecting --logging-steps)
+    if wandb_enabled and (step % logging_steps == 0):
+        # Determine current Adam betas from optimizer (they may change over time)
+        adam_beta1_current, adam_beta2_current = ADAM_BETAS
+        for g in optimizer.param_groups:
+            if g.get('kind') == 'adamw' and g.get('betas') is not None:
+                adam_beta1_current, adam_beta2_current = g['betas']
+                adam_beta1_current = float(adam_beta1_current)
+                adam_beta2_current = float(adam_beta2_current)
+                break
+        log_dict = {
+            "train/loss": debiased_smooth_loss,
+            "train/raw_loss": train_loss_f,
+            "train/lr_multiplier": lrm,
+            "train/momentum": muon_momentum,
+            "train/weight_decay": muon_weight_decay,
+            "train/adam_beta1": adam_beta1_current,
+            "train/adam_beta2": adam_beta2_current,
+            "train/step": step,
+            "train/throughput_tokens_per_sec": tok_per_sec,
+            "train/mfu": mfu,
+        }
+
+
+        # Evaluate `val/bpb` less frequently: once every 10 * logging_steps
+        val_log_interval = max(1, logging_steps * 10)
+        if step % val_log_interval == 0:
+            model.eval()
+            with autocast_ctx:
+                last_val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+            model.train()
+            log_dict["val/bpb"] = last_val_bpb
+        wandb.log(log_dict, step=step)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -627,4 +785,9 @@ print(f"mfu_percent:      {steady_state_mfu:.2f}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+print(f"model_preset:     {args.model}")
+
+# Finish Weights & Biases run
+if wandb_enabled:
+    wandb.log({"final/val_bpb": val_bpb})
+    wandb.finish()
